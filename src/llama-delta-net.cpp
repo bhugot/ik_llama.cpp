@@ -35,10 +35,13 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
 
     const bool has_explicit_seq_info = batch.n_seq_id != nullptr && batch.seq_id != nullptr;
     token_seq_ids.resize(batch.n_tokens, 0);
+    bool any_multi_seq = false;
     for (int i = 0; i < batch.n_tokens; ++i) {
         if (has_explicit_seq_info) {
             GGML_ASSERT(batch.n_seq_id[i] > 0 && "qwen3next expects each token to belong to at least one sequence");
-            GGML_ASSERT(batch.n_seq_id[i] == 1 && "qwen3next does not support multi-sequence tokens yet");
+            // a token shared by several sequences (common prefix) is computed once with the state of
+            // the first one; that state is then copied to the others
+            any_multi_seq = any_multi_seq || batch.n_seq_id[i] > 1;
             token_seq_ids[i] = batch.seq_id[i][0];
         } else {
             token_seq_ids[i] = 0;
@@ -60,8 +63,40 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         }
     }
 
+    // Batch mixing several multi-token sequences (prompts of several clients, HellaSwag): split it
+    // into contiguous runs of tokens with the same sequence set. Each run is computed like a
+    // single-sequence batch, in batch order (a sequence may have several runs: shared prefix first,
+    // then its own tokens).
+    if (any_multi_seq || (!all_same_seq && !has_unique_seq_ids)) {
+        auto same_seqs = [&](int32_t a, int32_t b) {
+            if (!has_explicit_seq_info) return true;
+            if (batch.n_seq_id[a] != batch.n_seq_id[b]) return false;
+            return std::equal(batch.seq_id[a], batch.seq_id[a] + batch.n_seq_id[a], batch.seq_id[b]);
+        };
+        int32_t start = 0;
+        for (int32_t i = 1; i <= batch.n_tokens; ++i) {
+            if (i == batch.n_tokens || !same_seqs(i, start)) {
+                seq_run run;
+                run.start = start;
+                run.len   = i - start;
+                if (has_explicit_seq_info) {
+                    for (int k = 1; k < batch.n_seq_id[start]; ++k) {
+                        run.extra.push_back(batch.seq_id[start][k]);
+                    }
+                }
+                seq_runs.push_back(std::move(run));
+                start = i;
+            }
+        }
+    }
+
     const uint32_t qnext_state_slots = llm_build_context::llama_kv_qnext_state_slots(lctx.kv_self);
     GGML_ASSERT(qnext_state_slots > 0);
+    for (const auto & run : seq_runs) {
+        for (llama_seq_id e : run.extra) {
+            GGML_ASSERT(e >= 0 && (uint32_t) e < qnext_state_slots);
+        }
+    }
 
     // Reserve-graph builds may not carry explicit sequence IDs, in which case
     // the fallback sequence slot is 0.
@@ -74,6 +109,9 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         ? lctx.kv_self.ckpt.per_step_max_allocated
         : 0;
     save_per_step_states = lctx.kv_self.save_per_step_ssm && batch.n_tokens > 1 && batch.n_tokens <= max_per_step;
+    if (!seq_runs.empty()) {
+        save_per_step_states = false; // per-step checkpoints: single-sequence batches only
+    }
 }
 
 delta_net::~delta_net() = default;
@@ -632,6 +670,140 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
 }
 
+// One contiguous run of tokens per sequence set.
+ggml_tensor * delta_net::build_layer_attn_linear_runs(ggml_context * ctx0, ggml_cgraph * gf,
+        ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
+        bool external_residual, ggml_unary_op gate_op) const {
+    auto & kv_self = lctx.kv_self;
+    ggml_tensor * s_l = kv_self.s_l[il];
+    GGML_ASSERT(s_l != nullptr);
+
+    auto & model   = lctx.model;
+    auto & hparams = model.hparams;
+    const bool split_graph = model.split_mode == LLAMA_SPLIT_MODE_GRAPH && s_l->extra;
+    if (!split_graph) {
+        // projections on the whole batch (large matmuls), recurrence per run
+        const int64_t head_k_dim  = hparams.ssm_d_state;
+        const int64_t num_k_heads = hparams.ssm_n_group;
+        const int64_t num_v_heads = hparams.ssm_dt_rank;
+        const int64_t head_v_dim  = hparams.ssm_d_inner / num_v_heads;
+        const int64_t n_tok       = cur->ne[1];
+        const uint32_t qnext_state_slots = llm_build_context::llama_kv_qnext_state_slots(kv_self);
+
+        int idx = model.default_layer_device[il];
+        auto input = cur;
+        if (input->op == GGML_OP_REDUCE) {
+            int idx_s_l = ggml_backend_sched_get_backend_idx(lctx.sched, s_l->buffer);
+            if (idx_s_l >= 0) idx = idx_s_l;
+            if (input->src[idx]) {
+                input->view_src = input->src[idx];
+            }
+        }
+        ggml_tensor * x = input;
+        if (model.layers[il].attn_norm) {
+            auto norm = model.layers[il].attn_norm->extra ? ((ggml_split_tensor_t *)model.layers[il].attn_norm->extra)->splits[idx] : model.layers[il].attn_norm;
+            x = llm_build_context::llm_build_norm(ctx0, input, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
+        }
+        auto [qkv_mixed, z] = build_qkvz(lctx, ctx0, model.layers[il].wqkv, model.layers[il].wqkv_gate, model.layers[il].ssm_in,
+                head_k_dim, num_k_heads, head_v_dim, num_v_heads, x, il, cb, gf);
+        auto [beta, gate] = build_beta_gate(lctx, ctx0, model.layers[il].ssm_beta_alpha, model.layers[il].ssm_beta, model.layers[il].ssm_alpha,
+                model.layers[il].ssm_dt, model.layers[il].ssm_a, num_k_heads, num_v_heads, 1, x, il, cb, gf);
+        GGML_ASSERT(qkv_mixed->ne[1] == n_tok && beta->ne[2] == n_tok && gate->ne[1] == n_tok);
+        qkv_mixed = ggml_cont(ctx0, qkv_mixed);
+        beta      = ggml_cont(ctx0, beta);
+        gate      = ggml_cont(ctx0, gate);
+
+        std::vector<ggml_tensor *> outs;
+        outs.reserve(seq_runs.size());
+        for (const auto & run : seq_runs) {
+            const size_t o = (size_t) run.start;
+            ggml_tensor * qkv_r  = ggml_view_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], run.len, 1, qkv_mixed->nb[1], qkv_mixed->nb[2], o * qkv_mixed->nb[1]);
+            ggml_tensor * beta_r = ggml_view_4d(ctx0, beta, beta->ne[0], beta->ne[1], run.len, 1, beta->nb[1], beta->nb[2], beta->nb[3], o * beta->nb[2]);
+            ggml_tensor * gate_r = ggml_view_3d(ctx0, gate, gate->ne[0], run.len, 1, gate->nb[1], gate->nb[2], o * gate->nb[1]);
+            ggml_tensor * inp_s_seq_qnext_r = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, run.len,
+                    lctx.inp_s_seq_qnext->nb[1], o * lctx.inp_s_seq_qnext->nb[1]);
+            const bool reset_state_r = batch.pos != nullptr && batch.pos[run.start] == 0;
+            const uint32_t state_seq_id_r = (uint32_t) token_seq_ids[run.start];
+            ggml_tensor * out_r = build_qkv(ctx0, s_l, model.layers[il].ssm_conv1d, qkv_r, inp_s_seq_qnext_r, beta_r, gate_r,
+                    head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
+                    state_seq_id_r, qnext_state_slots, reset_state_r, hparams.f_norm_rms_eps,
+                    model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, nullptr, nullptr);
+            outs.push_back(ggml_cont(ctx0, out_r));
+            if (!run.extra.empty()) {
+                ggml_tensor * src_row = ggml_view_1d(ctx0, s_l, s_l->ne[0], (size_t) state_seq_id_r * s_l->nb[1]);
+                for (llama_seq_id e : run.extra) {
+                    ggml_tensor * dst_row = ggml_view_1d(ctx0, s_l, s_l->ne[0], (size_t) e * s_l->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_row, dst_row));
+                }
+            }
+        }
+        while (outs.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t k = 0; k + 1 < outs.size(); k += 2) {
+                next.push_back(ggml_concat(ctx0, outs[k], outs[k + 1], 2));
+            }
+            if (outs.size() % 2) {
+                next.push_back(outs.back());
+            }
+            outs.swap(next);
+        }
+        ggml_tensor * output = outs.front();
+        auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z,
+                head_v_dim, num_v_heads, n_tok, il, cb, gate_op);
+        if (inp_out_ids) {
+            gated_output = ggml_get_rows(ctx0, gated_output, inp_out_ids);
+            input        = ggml_get_rows(ctx0, input, inp_out_ids);
+        }
+        output = external_residual ? gated_output : ggml_add(ctx0, gated_output, input);
+        cb(output, "ssm_output", il);
+        return output;
+    }
+
+    // split-mode graph (several devices): every run goes through the full path
+    std::vector<ggml_tensor *> outs;
+    outs.reserve(seq_runs.size());
+    for (const auto & run : seq_runs) {
+        ggml_tensor * cur_r = ggml_view_2d(ctx0, cur, cur->ne[0], run.len, cur->nb[1], (size_t) run.start * cur->nb[1]);
+        ggml_tensor * inp_s_seq_qnext_r = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, run.len,
+                lctx.inp_s_seq_qnext->nb[1], (size_t) run.start * lctx.inp_s_seq_qnext->nb[1]);
+        const bool reset_state_r = batch.pos != nullptr && batch.pos[run.start] == 0;
+        const uint32_t state_seq_id_r = (uint32_t) token_seq_ids[run.start];
+        // no output selection per run: done once after the concatenation
+        ggml_tensor * out_r = build_layer_attn_linear_core(ctx0, gf, cur_r, inp_s_seq_qnext_r, nullptr,
+                state_seq_id_r, reset_state_r, il, cb, external_residual, gate_op);
+        outs.push_back(out_r);
+
+        // shared prefix: copy the state (conv + delta-net) of the first sequence to the others.
+        // These nodes come after the state write and before the later runs that read it, so the
+        // graph order gives the execution order.
+        if (!run.extra.empty()) {
+            GGML_ASSERT(!(lctx.model.split_mode == LLAMA_SPLIT_MODE_GRAPH && s_l->extra) &&
+                    "shared-prefix batches are not supported with split-mode graph");
+            ggml_tensor * src_row = ggml_view_1d(ctx0, s_l, s_l->ne[0], (size_t) state_seq_id_r * s_l->nb[1]);
+            for (llama_seq_id e : run.extra) {
+                ggml_tensor * dst_row = ggml_view_1d(ctx0, s_l, s_l->ne[0], (size_t) e * s_l->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_row, dst_row));
+            }
+        }
+    }
+    // tree concatenation: each row is copied only log2(number of runs) times
+    while (outs.size() > 1) {
+        std::vector<ggml_tensor *> next;
+        for (size_t k = 0; k + 1 < outs.size(); k += 2) {
+            next.push_back(ggml_concat(ctx0, outs[k], outs[k + 1], 1));
+        }
+        if (outs.size() % 2) {
+            next.push_back(outs.back());
+        }
+        outs.swap(next);
+    }
+    ggml_tensor * out = outs.front();
+    if (inp_out_ids) {
+        out = ggml_get_rows(ctx0, out, inp_out_ids);
+    }
+    return out;
+}
+
 ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
         bool external_residual, ggml_unary_op gate_op) const {
@@ -649,6 +821,10 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     GGML_ASSERT(model.layers[il].ssm_out != nullptr);
     GGML_ASSERT(model.layers[il].wqkv != nullptr || model.layers[il].ssm_in != nullptr);
     GGML_ASSERT(model.layers[il].wqkv_gate != nullptr || model.layers[il].ssm_in != nullptr);
+
+    if (!seq_runs.empty()) {
+        return build_layer_attn_linear_runs(ctx0, gf, cur, inp_out_ids, il, cb, external_residual, gate_op);
+    }
 
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;

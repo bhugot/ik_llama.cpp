@@ -49,6 +49,17 @@ private:
     std::vector<llama_seq_id> token_seq_ids;
     bool all_same_seq;
     bool has_unique_seq_ids;
+    // contiguous runs of a mixed batch
+    struct seq_run {
+        int32_t start = 0;
+        int32_t len   = 0;
+        std::vector<llama_seq_id> extra; // other sequences of the run (shared prefix)
+    };
+    std::vector<seq_run> seq_runs;
+
+    ggml_tensor * build_layer_attn_linear_runs(ggml_context * ctx0, ggml_cgraph * gf,
+            ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
+            bool external_residual, ggml_unary_op gate_op) const;
 
     static std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * wqkv, ggml_tensor * wqkv_gate, ggml_tensor * input, int il, const llm_build_cb & cb,

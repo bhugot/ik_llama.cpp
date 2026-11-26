@@ -957,6 +957,13 @@ int llama_context::max_nodes(int n_tokens, int n_kv) const {
     if (model.arch == LLM_ARCH_INKLING2_LOOP && cparams.n_seq_max > 1) {
         max_nodes += 8 * model.hparams.n_layer * (cparams.n_seq_max - 1);
     }
+    if ((model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+            cparams.n_seq_max > 1) {
+        // mixed batches are split into runs (llama-delta-net.cpp), at most two per sequence (shared
+        // prefix, then its own tokens), each building its own recurrence
+        const int n_runs = std::max(1, std::min(n_tokens, 2 * (int) cparams.n_seq_max));
+        max_nodes += 96 * model.hparams.n_layer * n_runs;
+    }
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
     if (model.arch == LLM_ARCH_MINIMAX_M3 && !kv_self.kr_l.empty()) {
         // build_minimaxm3 scores each MINIMAXM3_MSA_SCORE_CHUNK query rows separately, 16 nodes per chunk and layer
@@ -7799,6 +7806,61 @@ static int llama_decode_internal(
     }
     lctx.n_queued_tokens += n_tokens_all;
 
+    // Qwen3-Next / Qwen3.5: a batch interleaving several sequences (token i of every sequence, then
+    // token i+1, ...) would give one recurrent run per token. Stable-sort the tokens by sequence so
+    // that each sequence is contiguous; outputs are mapped back to the caller's order below.
+    std::vector<uint32_t>       seq_sort_perm;
+    std::vector<llama_token>    seq_sort_token;
+    std::vector<llama_pos>      seq_sort_pos;
+    std::vector<int32_t>        seq_sort_n_seq_id;
+    std::vector<llama_seq_id *> seq_sort_seq_id;
+    std::vector<int8_t>         seq_sort_logits;
+    if ((model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+            n_tokens_all > 1 && batch_all.token && !batch_all.embd && batch_all.pos && batch_all.logits &&
+            batch_all.n_seq_id && batch_all.seq_id && !cparams.mtp) {
+        bool single = true;
+        for (uint32_t i = 0; i < n_tokens_all && single; ++i) {
+            single = batch_all.n_seq_id[i] == 1;
+        }
+        bool grouped = true;
+        if (single) {
+            std::unordered_set<llama_seq_id> closed;
+            for (uint32_t i = 1; i < n_tokens_all && grouped; ++i) {
+                const llama_seq_id s_prev = batch_all.seq_id[i - 1][0];
+                const llama_seq_id s_cur  = batch_all.seq_id[i][0];
+                if (s_cur != s_prev) {
+                    closed.insert(s_prev);
+                    grouped = closed.count(s_cur) == 0;
+                }
+            }
+        }
+        if (single && !grouped) {
+            seq_sort_perm.resize(n_tokens_all);
+            for (uint32_t i = 0; i < n_tokens_all; ++i) seq_sort_perm[i] = i;
+            std::stable_sort(seq_sort_perm.begin(), seq_sort_perm.end(), [&](uint32_t a, uint32_t b) {
+                return batch_all.seq_id[a][0] < batch_all.seq_id[b][0];
+            });
+            seq_sort_token.resize(n_tokens_all);
+            seq_sort_pos.resize(n_tokens_all);
+            seq_sort_n_seq_id.resize(n_tokens_all);
+            seq_sort_seq_id.resize(n_tokens_all);
+            seq_sort_logits.resize(n_tokens_all);
+            for (uint32_t k = 0; k < n_tokens_all; ++k) {
+                const uint32_t i = seq_sort_perm[k];
+                seq_sort_token[k]    = batch_all.token[i];
+                seq_sort_pos[k]      = batch_all.pos[i];
+                seq_sort_n_seq_id[k] = batch_all.n_seq_id[i];
+                seq_sort_seq_id[k]   = batch_all.seq_id[i];
+                seq_sort_logits[k]   = batch_all.logits[i];
+            }
+            batch_all.token    = seq_sort_token.data();
+            batch_all.pos      = seq_sort_pos.data();
+            batch_all.n_seq_id = seq_sort_n_seq_id.data();
+            batch_all.seq_id   = seq_sort_seq_id.data();
+            batch_all.logits   = seq_sort_logits.data();
+        }
+    }
+
     auto & kv_self = lctx.kv_self;
 
     const int64_t n_embd  = hparams.n_embd;
@@ -7865,6 +7927,17 @@ static int llama_decode_internal(
         }
     }
 
+    if (!seq_sort_perm.empty()) {
+        // output rows are produced in sorted order; index them by the caller's token positions
+        std::vector<int32_t> ids(n_tokens_all);
+        for (uint32_t k = 0; k < n_tokens_all; ++k) {
+            ids[seq_sort_perm[k]] = lctx.output_ids[k];
+        }
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            lctx.output_ids[i] = ids[i];
+        }
+    }
+
     auto & ckpt = kv_self.ckpt;
     bool capture_conv = ckpt.conv_slot >= 0 && ckpt.saved;
     if (capture_conv) {
@@ -7922,7 +7995,11 @@ static int llama_decode_internal(
                 }
             }
 
-            if (can_check && any_diff && has_dup) {
+            // Qwen3-Next / Qwen3.5 split mixed batches into contiguous runs themselves
+            // (llama-delta-net.cpp): no single-token fallback
+            const bool runs_supported = model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 ||
+                    model.arch == LLM_ARCH_QWEN35MOE;
+            if (can_check && any_diff && has_dup && !runs_supported) {
                 n_tokens = 1;
                 if (!warned_qnext_mixed_repeat) {
                     LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch contains repeated seq_id values; falling back to single-token chunking\n", __func__);
