@@ -238,6 +238,19 @@ static ggml_tensor * qwen4exp_ple(
     if (delta.batch_shares_one_seq()) {
         conv_out = qwen4exp_ple_conv(ctx0, gf, hparams, model, state_all, xt, hc_dim, n_tokens,
                 delta.state_slot(0), reset_state, il, cb, per_step_ple);
+    } else if (delta.n_runs() > 0) {
+        // A batch mixing multi-token sequences: one convolution per contiguous run, like the
+        // delta-net recurrence. Each run reads its sequence's history and writes it back before
+        // a later run of the same sequence reads it (graph order).
+        for (int32_t r = 0; r < delta.n_runs(); ++r) {
+            const int32_t start = delta.run_start(r);
+            const int32_t len   = delta.run_len(r);
+            ggml_tensor * x_r = ggml_cont(ctx0,
+                    ggml_view_2d(ctx0, xt, len, hc_dim, xt->nb[1], start*xt->nb[0]));
+            ggml_tensor * out_r = qwen4exp_ple_conv(ctx0, gf, hparams, model, state_all, x_r, hc_dim, len,
+                    delta.state_slot(start), reset_pos[start], il, cb, nullptr);
+            conv_out = conv_out ? ggml_concat(ctx0, conv_out, out_r, 0) : out_r;
+        }
     } else {
         // A mixed-sequence ubatch reads a different history per token, exactly as the
         // delta-net path splits it.

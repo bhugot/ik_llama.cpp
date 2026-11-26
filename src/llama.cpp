@@ -957,12 +957,16 @@ int llama_context::max_nodes(int n_tokens, int n_kv) const {
     if (model.arch == LLM_ARCH_INKLING2_LOOP && cparams.n_seq_max > 1) {
         max_nodes += 8 * model.hparams.n_layer * (cparams.n_seq_max - 1);
     }
-    if ((model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
-            cparams.n_seq_max > 1) {
+    if ((model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
+         model.arch == LLM_ARCH_QWEN4EXP) && cparams.n_seq_max > 1) {
         // mixed batches are split into runs (llama-delta-net.cpp), at most two per sequence (shared
-        // prefix, then its own tokens), each building its own recurrence
+        // prefix, then its own tokens), each building its own recurrence; Qwen4Exp also runs its
+        // PLE convolution once per run, on every PLE layer
         const int n_runs = std::max(1, std::min(n_tokens, 2 * (int) cparams.n_seq_max));
         max_nodes += 96 * model.hparams.n_layer * n_runs;
+        if (model.arch == LLM_ARCH_QWEN4EXP) {
+            max_nodes += (8 * model.hparams.ple_conv_kernel + 16) * model.hparams.n_layer * n_runs;
+        }
     }
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
     if (model.arch == LLM_ARCH_MINIMAX_M3 && !kv_self.kr_l.empty()) {
@@ -7815,7 +7819,8 @@ static int llama_decode_internal(
     std::vector<int32_t>        seq_sort_n_seq_id;
     std::vector<llama_seq_id *> seq_sort_seq_id;
     std::vector<int8_t>         seq_sort_logits;
-    if ((model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+    if ((model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
+         model.arch == LLM_ARCH_QWEN4EXP) &&
             n_tokens_all > 1 && batch_all.token && !batch_all.embd && batch_all.pos && batch_all.logits &&
             batch_all.n_seq_id && batch_all.seq_id && !cparams.mtp) {
         bool single = true;
@@ -7995,10 +8000,10 @@ static int llama_decode_internal(
                 }
             }
 
-            // Qwen3-Next / Qwen3.5 split mixed batches into contiguous runs themselves
-            // (llama-delta-net.cpp): no single-token fallback
+            // Qwen3-Next / Qwen3.5 / Qwen4Exp split mixed batches into contiguous runs themselves
+            // (llama-delta-net.cpp, build_qwen4exp.cpp): no single-token fallback
             const bool runs_supported = model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 ||
-                    model.arch == LLM_ARCH_QWEN35MOE;
+                    model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP;
             if (can_check && any_diff && has_dup && !runs_supported) {
                 n_tokens = 1;
                 if (!warned_qnext_mixed_repeat) {

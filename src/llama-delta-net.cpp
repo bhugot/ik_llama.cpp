@@ -48,12 +48,14 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         }
     }
 
-    // Mixed-batch runs are only wired into the Qwen3-Next / Qwen3.5 graphs. Other users of this
-    // class (Qwen4Exp, and the KDA models through llama-kda.cpp) keep per-token state updates that
-    // follow the first sequence of a token only, so they still refuse shared tokens.
-    const bool runs_arch = model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 ||
+    // Mixed-batch runs are wired into the Qwen3-Next / Qwen3.5 and Qwen4Exp graphs. Tokens shared
+    // by several sequences need their whole per-sequence state copied: done for the delta-net rows
+    // only, so Qwen4Exp (PLE history, n-gram rows) and the other users of this class (the KDA
+    // models through llama-kda.cpp) still refuse them.
+    const bool shared_ok = model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 ||
                            model.arch == LLM_ARCH_QWEN35MOE;
-    GGML_ASSERT((runs_arch || !any_multi_seq) && "multi-sequence tokens are not supported for this architecture yet");
+    const bool runs_arch = shared_ok || model.arch == LLM_ARCH_QWEN4EXP;
+    GGML_ASSERT((shared_ok || !any_multi_seq) && "multi-sequence tokens are not supported for this architecture yet");
 
     auto seq_id = token_seq_ids[0];
     all_same_seq = std::all_of(token_seq_ids.begin(), token_seq_ids.end(), [seq_id](llama_seq_id s) { return s == seq_id; });

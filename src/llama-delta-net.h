@@ -42,6 +42,12 @@ struct delta_net {
     bool     batch_shares_one_seq()  const { return all_same_seq; }
     uint32_t state_slot(int32_t i)   const { return (uint32_t) token_seq_ids[i]; }
 
+    // contiguous runs of a mixed batch, empty unless it mixes multi-token sequences: other
+    // per-sequence state of the row can then be updated one run at a time too
+    int32_t  n_runs()                const { return (int32_t) seq_runs.size(); }
+    int32_t  run_start(int32_t r)    const { return seq_runs[r].start; }
+    int32_t  run_len(int32_t r)      const { return seq_runs[r].len; }
+
 private:
 
     llama_context     & lctx;
