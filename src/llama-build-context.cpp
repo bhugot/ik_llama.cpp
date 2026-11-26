@@ -1608,9 +1608,9 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             *(float *)(cur->op_params + 2) = lctx.model.hparams.situ_beta;
             *(float *)(cur->op_params + 3) = lctx.model.hparams.situ_linear_beta;
             if (down) {
-                if (auto hadamard_d = lctx.model.hadamard_rotation(down); hadamard_d != nullptr) {
-                    cur = llm_build_hadamard_rotate(ctx, cur, *hadamard_d, false, true);
-                }
+                // llm_build_lora_mm applies the Hadamard transform of `down` itself: rotating here too
+                // would apply it twice (H(D H(D x)) != H(D x)) whenever a Hadamard-folded down weight
+                // takes the fused up/gate path (e.g. F16/BF16/IQ2_BN weights rotated after conversion).
                 cur = llm_build_lora_mm(lctx, ctx, down, cur);
                 cb(cur, "ffn_down", il);
                 if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
