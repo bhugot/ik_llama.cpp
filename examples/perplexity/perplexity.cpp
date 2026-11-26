@@ -984,7 +984,10 @@ static void hellaswag_score(llama_context * ctx, const gpt_params & params) {
     const int n_batch = params.n_batch;
 
     const int max_tasks_per_batch = 32;
-    const int max_seq = std::min(4*max_tasks_per_batch, (int) llama_n_seq_max(ctx));
+    // llama_n_seq_max() returns the cache size here, not the number of sequences: for a recurrent
+    // model, stay within the state slots actually allocated (-np)
+    const int max_seq = std::min(4*max_tasks_per_batch, (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))
+            ? params.n_parallel : (int) llama_n_seq_max(ctx));
 
     llama_batch batch = llama_batch_init(n_ctx, 0, 4);
 
@@ -995,6 +998,66 @@ static void hellaswag_score(llama_context * ctx, const gpt_params & params) {
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
     std::vector<std::thread> workers(std::thread::hardware_concurrency());
+
+    // Recurrent or hybrid models (Qwen3.5, delta-net): by default the batched scoring below is used
+    // (common prefix shared by the 4 endings). With IK_HELLASWAG_SEQUENTIAL=1: one ending at a time,
+    // a single sequence per decode, prefix recomputed 4 times (reference that does not depend on
+    // mixed-batch support in the engine).
+    if ((llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) && getenv("IK_HELLASWAG_SEQUENTIAL") != nullptr) {
+        fprintf(stderr, "%s : recurrent/hybrid model, evaluating one ending at a time\n", __func__);
+        for (size_t i = 0; i < hs_task_count; ++i) {
+            auto & hs_cur = hs_data[i];
+            const size_t cp = hs_cur.common_prefix;
+            for (int s = 0; s < 4; ++s) {
+                const auto & toks = hs_cur.seq_tokens[s];
+                if (cp == 0 || toks.size() <= cp || (int) toks.size() > n_ctx) {
+                    fprintf(stderr, "%s : task %zu ending %d cannot be scored (prefix %zu, %zu tokens, n_ctx %d)\n",
+                            __func__, i, s, cp, toks.size(), n_ctx);
+                    llama_batch_free(batch);
+                    return;
+                }
+                common_batch_clear(batch);
+                // logits needed from the last prefix token up to the second-to-last token
+                for (size_t j = 0; j < toks.size(); ++j) {
+                    common_batch_add(batch, toks[j], j, { 0 }, j + 1 >= cp && j + 1 < toks.size());
+                }
+                llama_kv_cache_clear(ctx);
+                if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
+                    fprintf(stderr, "%s: llama_decode() failed\n", __func__);
+                    llama_batch_free(batch);
+                    return;
+                }
+                eval_pairs.clear();
+                for (size_t j = cp - 1; j + 1 < toks.size(); ++j) {
+                    eval_pairs.emplace_back(j - (cp - 1), toks[j + 1]);
+                }
+                compute_logprobs(batch_logits.data(), n_vocab, workers, eval_pairs, eval_results);
+                double lp = 0.0;
+                for (float v : eval_results) {
+                    lp += v;
+                }
+                hs_cur.ending_logprob_count[s] = eval_pairs.size();
+                hs_cur.ending_logprob[s] = lp / eval_pairs.size();
+            }
+
+            size_t ending_logprob_max_idx = 0;
+            double ending_logprob_max_val = hs_cur.ending_logprob[0];
+            for (size_t s = 1; s < 4; s++) {
+                if (hs_cur.ending_logprob[s] > ending_logprob_max_val) {
+                    ending_logprob_max_idx = s;
+                    ending_logprob_max_val = hs_cur.ending_logprob[s];
+                }
+            }
+            if (ending_logprob_max_idx == hs_cur.gold_ending_idx) {
+                acc += 1.0;
+            }
+            printf("%zu\t%.8lf\n", i + 1, acc/double(i + 1)*100.0);
+            fflush(stdout);
+        }
+        llama_batch_free(batch);
+        printf("\n");
+        return;
+    }
 
     for (size_t i0 = 0; i0 < hs_task_count; i0++) {
         int n_cur = 0;
