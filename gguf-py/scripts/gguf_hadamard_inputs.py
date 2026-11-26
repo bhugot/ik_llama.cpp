@@ -15,6 +15,14 @@ block size and the sign vectors that were used: {"block": 256, "signs": {"2048":
 
     python gguf_hadamard_inputs.py in.gguf out.gguf --block 256
     python gguf_hadamard_inputs.py in.gguf out.gguf --metadata-only --signs-json signs.json --max-layer 24
+
+Gated delta-net models with more value heads than key heads (e.g. Qwen3.5 4B/9B/35B-A3B): convert_hf_to_gguf
+stores the ssm_out input columns in tiled [head_dim, n_k, rep] order, while a rotation learned on the source
+checkpoint is defined in its grouped [head_dim, rep, n_k] order. --regroup-ssm-out puts the columns of the
+selected ssm_out weights back in grouped order and sets prism.hadamard.gdn_v_grouped, so that the runtime
+regroups the activation the same way before the Hadamard transform:
+
+    python gguf_hadamard_inputs.py in.gguf out.gguf --metadata-only --signs-json signs.json --regroup-ssm-out
 """
 from __future__ import annotations
 
@@ -98,6 +106,9 @@ def main() -> None:
     ap.add_argument("--max-layer", type=int, default=-1, help="only blk.i with i < N (e.g. skip an MTP layer)")
     ap.add_argument("--gdn-v-grouped", action="store_true",
                     help="set prism.hadamard.gdn_v_grouped (rotation defined in grouped value-head order)")
+    ap.add_argument("--regroup-ssm-out", action="store_true",
+                    help="put ssm_out input columns back in grouped value-head order (rotation learned on the "
+                         "source checkpoint) and set prism.hadamard.gdn_v_grouped")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -142,6 +153,20 @@ def main() -> None:
                      else rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=w)) for w in widths}
     hb = hadamard(b)
     names = {t.name for t in selected}
+    regroup = set()
+    if args.regroup_ssm_out:
+        n_k = get_field_data(reader, f"{arch}.ssm.group_count")
+        n_v = get_field_data(reader, f"{arch}.ssm.time_step_rank")
+        if not n_k or not n_v or int(n_v) % int(n_k):
+            sys.exit("--regroup-ssm-out: missing or inconsistent ssm.group_count / ssm.time_step_rank")
+        n_k, n_v = int(n_k), int(n_v)
+        regroup = {t.name for t in selected if ".ssm_out." in t.name} if n_v != n_k else set()
+        for t in selected:
+            if t.name in regroup and t.tensor_type not in ok_types:
+                sys.exit(f"{t.name} is {t.tensor_type.name}: --regroup-ssm-out needs F32/F16/BF16 weights")
+            if t.name in regroup and int(t.shape[0]) % n_v:
+                sys.exit(f"{t.name}: ne0={int(t.shape[0])} is not a multiple of {n_v} value heads")
+        logger.info(f"regrouping {len(regroup)} ssm_out weights (key heads {n_k}, value heads {n_v})")
     logger.info(f"{'tagging' if args.metadata_only else 'rotating'} {len(selected)} tensors, block {b}, widths {widths}")
 
     writer = gguf.GGUFWriter(args.output, arch=arch)
@@ -160,7 +185,7 @@ def main() -> None:
     writer.add_array("prism.hadamard.weight_names", sorted(names))
     writer.add_array("prism.hadamard.sign_widths", [int(w) for w in widths])
     writer.add_array("prism.hadamard.sign_values", [int(v) for w in widths for v in signs[w]])
-    if args.gdn_v_grouped:
+    if args.gdn_v_grouped or regroup:
         writer.add_bool("prism.hadamard.gdn_v_grouped", True)
 
     for t in reader.tensors:
@@ -170,6 +195,16 @@ def main() -> None:
     writer.write_ti_data_to_file()
     for t in reader.tensors:
         data = t.data
+        if t.name in regroup:
+            n = int(t.shape[0])
+            raw = np.asarray(data)
+            a = raw.view(np.uint16) if t.tensor_type == gguf.GGMLQuantizationType.BF16 else raw
+            a = a.reshape(-1, n)
+            o, hd = a.shape[0], n // n_v
+            # tiled [hd, n_k, rep] -> grouped [hd, rep, n_k] (ggml order, fastest first)
+            a = np.ascontiguousarray(a.reshape(o, n_v // n_k, n_k, hd).transpose(0, 2, 1, 3).reshape(o, n))
+            data = a.view(np.uint8).reshape(raw.shape) if t.tensor_type == gguf.GGMLQuantizationType.BF16 else a.reshape(raw.shape)
+            logger.debug(f"regrouped {t.name}")
         if t.name in names and not args.metadata_only:
             n = int(t.shape[0])
             if t.tensor_type == gguf.GGMLQuantizationType.BF16:
