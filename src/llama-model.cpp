@@ -3405,8 +3405,8 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
 }
 
 const llama_hadamard_transform * llama_model::hadamard_rotation(const struct ggml_tensor * t) const {
-    // qwen4exp (Gyro) uses the same prism.hadamard kvs as qwen35 (Prism)
-    if (!t || (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN4EXP)) {
+    // qwen35moe and qwen4exp (Gyro) use the same prism.hadamard kvs as qwen35 (Prism)
+    if (!t || (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP)) {
         return nullptr;
     }
     const auto it = hadamard_map.find(t->name);
