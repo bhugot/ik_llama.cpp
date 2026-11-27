@@ -2159,6 +2159,46 @@ void llm_load_hadamard(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_WARN("%s: disabled via IK_HADAMARD_DISABLE\n", __func__);
         return;
     }
+    // residual-stream rotation (independent of the per-weight rotations below)
+    {
+        uint32_t sb = 0;
+        std::vector<int32_t> sv;
+        if (ml.get_key("prism.stream_rotation.block_size", sb, false)) {
+            ml.get_arr("prism.stream_rotation.signs", sv, false);
+            const int64_t n = (int64_t) model.hparams.n_embd;
+            bool ok = sb > 0 && (sb & (sb - 1)) == 0 && n % sb == 0 && (int64_t) sv.size() == n;
+            for (const int32_t v : sv) ok = ok && (v == 1 || v == -1);
+            if (!ok) {
+                LLAMA_LOG_WARN("%s: invalid prism.stream_rotation (block %u, %zu signs, n_embd %lld), ignoring it\n",
+                        __func__, sb, sv.size(), (long long) n);
+            } else {
+                std::vector<float> sf(sv.begin(), sv.end());
+                ggml_backend_buffer_type_t buft = llama_default_buffer_type_cpu(true);
+                if (model.output_norm && model.output_norm->buffer) {
+                    ggml_backend_buffer_type_t wb = ggml_backend_buffer_get_type(model.output_norm->buffer);
+                    if (!ggml_backend_buft_is_host(wb)) buft = wb;
+                }
+                ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+                ggml_context * ctx = ggml_init(params);
+                ggml_tensor * signs = ctx ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n) : nullptr;
+                ggml_backend_buffer_t buf = signs ? ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft) : nullptr;
+                if (buf == nullptr) {
+                    if (ctx) ggml_free(ctx);
+                    LLAMA_LOG_WARN("%s: cannot allocate prism.stream_rotation signs, ignoring it\n", __func__);
+                } else {
+                    ggml_set_name(signs, "prism.stream_rotation.signs");
+                    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    ggml_backend_tensor_set(signs, sf.data(), 0, sf.size() * sizeof(float));
+                    model.ctxs.push_back(ctx);
+                    model.bufs.push_back(buf);
+                    model.stream_rot.signs = signs;
+                    model.stream_rot.block_size = sb;
+                    LLAMA_LOG_INFO("%s: residual-stream rotation enabled: block %u, %lld signs\n",
+                            __func__, sb, (long long) n);
+                }
+            }
+        }
+    }
     uint32_t version = 0;
     if (!ml.get_key("prism.hadamard.version", version, false)) {
         return;

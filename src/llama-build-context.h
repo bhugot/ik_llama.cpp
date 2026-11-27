@@ -182,6 +182,9 @@ struct llm_build_context {
 
     struct ggml_tensor * build_inp_mtp_states(int64_t n_hidden);
 
+    // undo the residual-stream rotation before the final norm (x -> x Q^T); no-op without prism.stream_rotation
+    struct ggml_tensor * build_stream_unrotate(struct ggml_tensor * cur);
+
     struct ggml_tensor * build_mtp_input(
             const struct llama_layer & mtp_layer,
             struct ggml_tensor * hidden_state,

@@ -68,6 +68,8 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             inpL = cur;
         }
 
+        inpL = build_stream_unrotate(inpL);
+
         if (n_outputs == 0) {
             cur = llm_build_norm(ctx0, inpL, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
             cb(cur, "result_norm", -1);
@@ -223,6 +225,8 @@ ggml_cgraph * llm_build_context::build_qwen35() {
                 cur = inpL;
             }
         }
+
+        inpL = build_stream_unrotate(inpL);
 
         if (n_outputs == 0) {
             cur = llm_build_norm(ctx0, inpL, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);

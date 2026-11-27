@@ -574,6 +574,10 @@ struct llama_model {
     // Prism ternary Hadamard rotations, keyed by GGUF weight name (empty for other models)
     std::unordered_map<std::string, llama_hadamard_transform> hadamard_map;
     const llama_hadamard_transform * hadamard_rotation(const struct ggml_tensor * t) const;
+    // Residual-stream rotation Q = diag(s) H_b (prism.stream_rotation.*): the embedding table and the final
+    // norm are stored unrotated (tied head kept), the stream is rotated after the embedding lookup (x Q)
+    // and rotated back before the final norm (x Q^T). block_size == 0: none.
+    llama_hadamard_transform stream_rot;
 
     struct ggml_tensor * tok_embd = nullptr;
     struct ggml_tensor * type_embd;

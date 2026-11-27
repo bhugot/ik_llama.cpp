@@ -1045,6 +1045,15 @@ static struct ggml_tensor * llm_build_hadamard_rotate(
     return out;
 }
 
+struct ggml_tensor * llm_build_context::build_stream_unrotate(struct ggml_tensor * cur) {
+    if (model.stream_rot.block_size == 0) {
+        return cur;
+    }
+    cur = llm_build_hadamard_rotate(ctx0, cur, model.stream_rot, true, false);
+    cb(cur, "stream_unrot", -1);
+    return cur;
+}
+
 ggml_tensor * llm_build_context::llm_build_inp_embd(
         struct ggml_context * ctx,
        struct llama_context & lctx,
@@ -1070,6 +1079,11 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
         // undo the Hadamard rotation of the embedding table
         if (auto rot = lctx.model.hadamard_rotation(tok_embd); rot != nullptr) {
             inpL = llm_build_hadamard_rotate(ctx, inpL, *rot, true, false);
+        }
+        // rotate the residual stream: x -> x Q (Q = diag(s) H_b)
+        if (tok_embd == lctx.model.tok_embd && lctx.model.stream_rot.block_size > 0) {
+            inpL = llm_build_hadamard_rotate(ctx, inpL, lctx.model.stream_rot, false, false);
+            cb(inpL, "inp_embd_rot", -1);
         }
     } else {
        lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
