@@ -578,6 +578,10 @@ struct llama_model {
     // norm are stored unrotated (tied head kept), the stream is rotated after the embedding lookup (x Q)
     // and rotated back before the final norm (x Q^T). block_size == 0: none.
     llama_hadamard_transform stream_rot;
+    // Dense variant (prism.stream_rotation.matrix, any n_embd, e.g. 2560): y = x Q with stream_rot_fwd = Q^T
+    // and y = x Q^T with stream_rot_inv = Q, both [n_embd, n_embd] F32 applied with ggml_mul_mat.
+    struct ggml_tensor * stream_rot_fwd = nullptr;
+    struct ggml_tensor * stream_rot_inv = nullptr;
 
     struct ggml_tensor * tok_embd = nullptr;
     struct ggml_tensor * type_embd;

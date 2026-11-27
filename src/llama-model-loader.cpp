@@ -2163,7 +2163,46 @@ void llm_load_hadamard(llama_model_loader & ml, llama_model & model) {
     {
         uint32_t sb = 0;
         std::vector<int32_t> sv;
-        if (ml.get_key("prism.stream_rotation.block_size", sb, false)) {
+        std::vector<float> qm;
+        if (ml.get_arr("prism.stream_rotation.matrix", qm, false)) {
+            // dense Q, row-major Q[i][k]; fwd = Q^T, inv = Q (ggml_mul_mat(a, x) = a_rows . x)
+            const int64_t n = (int64_t) model.hparams.n_embd;
+            bool ok = (int64_t) qm.size() == n * n;
+            for (size_t i = 0; ok && i < qm.size(); ++i) ok = std::isfinite(qm[i]);
+            if (!ok) {
+                LLAMA_LOG_WARN("%s: invalid prism.stream_rotation.matrix (%zu values, n_embd %lld), ignoring it\n",
+                        __func__, qm.size(), (long long) n);
+            } else {
+                std::vector<float> qt(qm.size());
+                for (int64_t i = 0; i < n; ++i) for (int64_t k = 0; k < n; ++k) qt[i*n + k] = qm[k*n + i];
+                ggml_backend_buffer_type_t buft = llama_default_buffer_type_cpu(true);
+                if (model.output_norm && model.output_norm->buffer) {
+                    ggml_backend_buffer_type_t wb = ggml_backend_buffer_get_type(model.output_norm->buffer);
+                    if (!ggml_backend_buft_is_host(wb)) buft = wb;
+                }
+                ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+                ggml_context * ctx = ggml_init(params);
+                ggml_tensor * fwd = ctx ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n) : nullptr;
+                ggml_tensor * inv = ctx ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n) : nullptr;
+                ggml_backend_buffer_t buf = inv ? ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft) : nullptr;
+                if (buf == nullptr) {
+                    if (ctx) ggml_free(ctx);
+                    LLAMA_LOG_WARN("%s: cannot allocate prism.stream_rotation.matrix, ignoring it\n", __func__);
+                } else {
+                    ggml_set_name(fwd, "prism.stream_rotation.fwd");
+                    ggml_set_name(inv, "prism.stream_rotation.inv");
+                    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    ggml_backend_tensor_set(fwd, qt.data(), 0, qt.size() * sizeof(float));
+                    ggml_backend_tensor_set(inv, qm.data(), 0, qm.size() * sizeof(float));
+                    model.ctxs.push_back(ctx);
+                    model.bufs.push_back(buf);
+                    model.stream_rot_fwd = fwd;
+                    model.stream_rot_inv = inv;
+                    LLAMA_LOG_INFO("%s: residual-stream rotation enabled: dense %lld x %lld\n",
+                            __func__, (long long) n, (long long) n);
+                }
+            }
+        } else if (ml.get_key("prism.stream_rotation.block_size", sb, false)) {
             ml.get_arr("prism.stream_rotation.signs", sv, false);
             const int64_t n = (int64_t) model.hparams.n_embd;
             bool ok = sb > 0 && (sb & (sb - 1)) == 0 && n % sb == 0 && (int64_t) sv.size() == n;

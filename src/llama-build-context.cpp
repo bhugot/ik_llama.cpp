@@ -1046,6 +1046,11 @@ static struct ggml_tensor * llm_build_hadamard_rotate(
 }
 
 struct ggml_tensor * llm_build_context::build_stream_unrotate(struct ggml_tensor * cur) {
+    if (model.stream_rot_inv != nullptr) {
+        cur = ggml_mul_mat(ctx0, model.stream_rot_inv, cur);
+        cb(cur, "stream_unrot", -1);
+        return cur;
+    }
     if (model.stream_rot.block_size == 0) {
         return cur;
     }
@@ -1081,7 +1086,10 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
             inpL = llm_build_hadamard_rotate(ctx, inpL, *rot, true, false);
         }
         // rotate the residual stream: x -> x Q (Q = diag(s) H_b)
-        if (tok_embd == lctx.model.tok_embd && lctx.model.stream_rot.block_size > 0) {
+        if (tok_embd == lctx.model.tok_embd && lctx.model.stream_rot_fwd != nullptr) {
+            inpL = ggml_mul_mat(ctx, lctx.model.stream_rot_fwd, inpL);
+            cb(inpL, "inp_embd_rot", -1);
+        } else if (tok_embd == lctx.model.tok_embd && lctx.model.stream_rot.block_size > 0) {
             inpL = llm_build_hadamard_rotate(ctx, inpL, lctx.model.stream_rot, false, false);
             cb(inpL, "inp_embd_rot", -1);
         }
